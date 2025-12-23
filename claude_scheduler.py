@@ -1,10 +1,15 @@
 import rumps
 import subprocess
 import threading
+import os
+import json
 from datetime import datetime, timedelta
 
 # Daily schedule times (24hr format)
 SCHEDULE_TIMES = ["04:00", "09:00", "14:00", "19:00"]
+
+# Preferences file
+PREFS_FILE = os.path.expanduser("~/.claude_scheduler_prefs.json")
 
 class ClaudeScheduler(rumps.App):
     def __init__(self):
@@ -24,8 +29,63 @@ class ClaudeScheduler(rumps.App):
         self.cancel_button = rumps.MenuItem("Cancel Custom", callback=self.cancel_custom)
         self.next_label = rumps.MenuItem("Next: --:--", callback=None)
         self.next_label.set_callback(None)
+        self.login_button = rumps.MenuItem("Start at Login", callback=self.toggle_login_item)
 
-        self.menu = [self.auto_button, self.custom_button, self.next_label]
+        # Check if already in login items
+        if self.is_login_item():
+            self.login_button.state = 1
+
+        self.menu = [self.auto_button, self.custom_button, self.next_label, None, self.login_button]
+
+        # Auto-start schedule if preference is set
+        if self.load_prefs().get("auto_schedule_enabled", False):
+            self.toggle_auto(self.auto_button)
+
+    def load_prefs(self):
+        try:
+            with open(PREFS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+
+    def save_prefs(self, prefs):
+        try:
+            with open(PREFS_FILE, "w") as f:
+                json.dump(prefs, f)
+        except:
+            pass
+
+    def is_login_item(self):
+        script = '''
+        tell application "System Events"
+            get the name of every login item
+        end tell
+        '''
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        return "Claude Scheduler" in result.stdout
+
+    def toggle_login_item(self, sender):
+        app_path = "/Applications/Claude Scheduler.app"
+        if sender.state == 0:
+            # Add to login items
+            script = f'''
+            tell application "System Events"
+                make login item at end with properties {{path:"{app_path}", hidden:false}}
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", script])
+            sender.state = 1
+            rumps.notification("Claude Scheduler", "Enabled", "Will start at login")
+        else:
+            # Remove from login items
+            script = '''
+            tell application "System Events"
+                delete login item "Claude Scheduler"
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", script])
+            sender.state = 0
+            rumps.notification("Claude Scheduler", "Disabled", "Removed from login items")
 
     def start_caffeinate(self):
         if self.caffeinate_process is None:
@@ -59,6 +119,7 @@ class ClaudeScheduler(rumps.App):
             sender.title = "Enable Auto Schedule"
             self.title = "⏰ Claude"
             self.next_label.title = "Next: --:--"
+            self.save_prefs({"auto_schedule_enabled": False})
             rumps.notification("Claude Scheduler", "Disabled", "Auto schedule stopped")
         else:
             # Enable auto mode - cancel any custom schedule first
@@ -71,6 +132,7 @@ class ClaudeScheduler(rumps.App):
             self.start_caffeinate()
             sender.title = "Disable Auto Schedule"
             self.start_schedule_checker()
+            self.save_prefs({"auto_schedule_enabled": True})
             rumps.notification("Claude Scheduler", "Enabled", f"Auto schedule active: {', '.join(SCHEDULE_TIMES)}")
 
     def set_custom_time(self, _):
