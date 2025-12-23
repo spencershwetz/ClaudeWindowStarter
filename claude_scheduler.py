@@ -1,25 +1,33 @@
 import rumps
 import subprocess
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
+
+# Daily schedule times (24hr format)
+SCHEDULE_TIMES = ["04:00", "09:00", "14:00", "19:00"]
 
 class ClaudeScheduler(rumps.App):
     def __init__(self):
         super().__init__("⏰ Claude", icon=None, quit_button="Quit")
-        self.scheduled_time = None
-        self.timer_thread = None
-        self.cancel_event = threading.Event()
+        self.auto_mode = False
+        self.check_thread = None
+        self.stop_event = threading.Event()
         self.caffeinate_process = None
+        self.last_triggered = None
+        self.custom_time = None
+        self.custom_thread = None
+        self.custom_cancel_event = threading.Event()
 
         # Create menu items
-        self.schedule_button = rumps.MenuItem("Schedule Claude", callback=self.set_time)
-        self.cancel_button = rumps.MenuItem("Cancel Schedule", callback=self.cancel)
+        self.auto_button = rumps.MenuItem("Enable Auto Schedule", callback=self.toggle_auto)
+        self.custom_button = rumps.MenuItem("Schedule Custom Time", callback=self.set_custom_time)
+        self.cancel_button = rumps.MenuItem("Cancel Custom", callback=self.cancel_custom)
+        self.next_label = rumps.MenuItem("Next: --:--", callback=None)
+        self.next_label.set_callback(None)
 
-        # Only show schedule button initially (no cancel until something is scheduled)
-        self.menu = [self.schedule_button]
+        self.menu = [self.auto_button, self.custom_button, self.next_label]
 
     def start_caffeinate(self):
-        # Prevent Mac from sleeping while schedule is active
         if self.caffeinate_process is None:
             self.caffeinate_process = subprocess.Popen(["caffeinate", "-i"])
 
@@ -28,7 +36,44 @@ class ClaudeScheduler(rumps.App):
             self.caffeinate_process.terminate()
             self.caffeinate_process = None
 
-    def set_time(self, _):
+    def get_next_scheduled_time(self):
+        now = datetime.now()
+        today = now.date()
+
+        for time_str in SCHEDULE_TIMES:
+            hour, minute = map(int, time_str.split(":"))
+            scheduled = datetime.combine(today, datetime.strptime(time_str, "%H:%M").time())
+            if scheduled > now:
+                return scheduled
+
+        # If all times passed today, return first time tomorrow
+        hour, minute = map(int, SCHEDULE_TIMES[0].split(":"))
+        return datetime.combine(today + timedelta(days=1), datetime.strptime(SCHEDULE_TIMES[0], "%H:%M").time())
+
+    def toggle_auto(self, sender):
+        if self.auto_mode:
+            # Disable auto mode
+            self.auto_mode = False
+            self.stop_event.set()
+            self.stop_caffeinate()
+            sender.title = "Enable Auto Schedule"
+            self.title = "⏰ Claude"
+            self.next_label.title = "Next: --:--"
+            rumps.notification("Claude Scheduler", "Disabled", "Auto schedule stopped")
+        else:
+            # Enable auto mode - cancel any custom schedule first
+            if self.custom_time:
+                self.custom_cancel_event.set()
+                self.clear_custom()
+
+            self.auto_mode = True
+            self.stop_event.clear()
+            self.start_caffeinate()
+            sender.title = "Disable Auto Schedule"
+            self.start_schedule_checker()
+            rumps.notification("Claude Scheduler", "Enabled", f"Auto schedule active: {', '.join(SCHEDULE_TIMES)}")
+
+    def set_custom_time(self, _):
         # Default to next hour + 1 minute
         now = datetime.now()
         next_hour = (now.hour + 1) % 24
@@ -36,7 +81,7 @@ class ClaudeScheduler(rumps.App):
 
         window = rumps.Window(
             message='Enter time (HH:MM in 24hr format):',
-            title='Schedule Claude',
+            title='Schedule Custom Time',
             default_text=default_time,
             dimensions=(200, 24)
         )
@@ -44,29 +89,39 @@ class ClaudeScheduler(rumps.App):
         if response.clicked:
             time_input = response.text.strip()
 
-            # Auto-insert colon if user just typed 4 digits (e.g., "1701" -> "17:01")
+            # Auto-insert colon if user just typed 4 digits
             if len(time_input) == 4 and time_input.isdigit():
                 time_input = f"{time_input[:2]}:{time_input[2:]}"
 
-            self.scheduled_time = time_input
             try:
-                # Validate time format
-                datetime.strptime(self.scheduled_time, "%H:%M")
-                self.title = f"⏰ {self.scheduled_time}"
-                self.cancel_event.clear()
+                datetime.strptime(time_input, "%H:%M")
+
+                # Cancel auto mode if active
+                if self.auto_mode:
+                    self.auto_mode = False
+                    self.stop_event.set()
+                    self.auto_button.title = "Enable Auto Schedule"
+
+                self.custom_time = time_input
+                self.custom_cancel_event.clear()
                 self.start_caffeinate()
-                self.start_scheduler()
+                self.start_custom_scheduler()
 
                 # Show cancel button
-                if "Cancel Schedule" not in self.menu:
-                    self.menu.insert_after("Schedule Claude", self.cancel_button)
+                if "Cancel Custom" not in self.menu:
+                    self.menu.insert_after("Schedule Custom Time", self.cancel_button)
 
+                if not self.auto_mode:
+                    self.title = f"⏰ {self.custom_time}"
+                    self.next_label.title = f"Next: {self.custom_time}"
+
+                rumps.notification("Claude Scheduler", "Scheduled!", f"Custom time set for {self.custom_time}")
             except ValueError:
                 rumps.notification("Claude Scheduler", "Error", "Invalid time format. Use HH:MM")
 
-    def start_scheduler(self):
+    def start_custom_scheduler(self):
         def run_at_time():
-            target = datetime.strptime(self.scheduled_time, "%H:%M").replace(
+            target = datetime.strptime(self.custom_time, "%H:%M").replace(
                 year=datetime.now().year,
                 month=datetime.now().month,
                 day=datetime.now().day
@@ -75,67 +130,91 @@ class ClaudeScheduler(rumps.App):
 
             if wait_seconds <= 0:
                 rumps.notification("Claude Scheduler", "Error", "Time has already passed today")
-                self.title = "⏰ Claude"
-                self.hide_cancel()
-                self.stop_caffeinate()
+                self.clear_custom()
                 return
 
             # Wait in small increments so we can cancel
             while wait_seconds > 0:
-                if self.cancel_event.is_set():
+                if self.custom_cancel_event.is_set():
                     return
                 sleep_time = min(1, wait_seconds)
                 threading.Event().wait(sleep_time)
                 wait_seconds -= sleep_time
 
-            if self.cancel_event.is_set():
+            if self.custom_cancel_event.is_set():
                 return
 
-            # Open Terminal and start claude in tmux
-            cmd = 'tmux kill-session -t claude_session 2>/dev/null; tmux new-session -d -s claude_session \\"claude\\" && tmux attach -t claude_session'
+            self.trigger_claude()
+            self.clear_custom()
 
-            script = f'''
-            tell application "Terminal"
-                activate
-                do script "{cmd}"
-            end tell
-            '''
-            subprocess.run(["osascript", "-e", script])
+        if self.custom_thread and self.custom_thread.is_alive():
+            self.custom_cancel_event.set()
+            self.custom_thread.join(timeout=2)
+            self.custom_cancel_event.clear()
 
-            rumps.notification("Claude Scheduler", "Running!", "Claude started")
+        self.custom_thread = threading.Thread(target=run_at_time, daemon=True)
+        self.custom_thread.start()
+
+    def cancel_custom(self, _):
+        self.custom_cancel_event.set()
+        self.clear_custom()
+        rumps.notification("Claude Scheduler", "Cancelled", "Custom schedule cleared")
+
+    def clear_custom(self):
+        self.custom_time = None
+        if "Cancel Custom" in self.menu:
+            del self.menu["Cancel Custom"]
+        if not self.auto_mode:
             self.title = "⏰ Claude"
-            self.scheduled_time = None
-            self.hide_cancel()
+            self.next_label.title = "Next: --:--"
             self.stop_caffeinate()
 
-            # Wait 30 seconds then send "hi" (in a separate thread so we don't block)
-            def send_hi():
-                threading.Event().wait(30)
-                subprocess.run(["tmux", "send-keys", "-t", "claude_session", "hi"])
-                threading.Event().wait(1)
-                subprocess.run(["tmux", "send-keys", "-t", "claude_session", "Enter"])
+    def start_schedule_checker(self):
+        def check_loop():
+            while not self.stop_event.is_set():
+                now = datetime.now()
+                current_time = now.strftime("%H:%M")
 
-            threading.Thread(target=send_hi, daemon=True).start()
+                # Update next scheduled time display
+                next_time = self.get_next_scheduled_time()
+                self.next_label.title = f"Next: {next_time.strftime('%H:%M')}"
+                self.title = f"⏰ {next_time.strftime('%H:%M')}"
 
-        if self.timer_thread and self.timer_thread.is_alive():
-            self.cancel_event.set()
-            self.timer_thread.join(timeout=2)
+                # Check if current time matches any schedule
+                if current_time in SCHEDULE_TIMES:
+                    # Avoid triggering twice in the same minute
+                    if self.last_triggered != current_time:
+                        self.last_triggered = current_time
+                        self.trigger_claude()
 
-        self.timer_thread = threading.Thread(target=run_at_time, daemon=True)
-        self.timer_thread.start()
-        rumps.notification("Claude Scheduler", "Scheduled!", f"Will run at {self.scheduled_time}")
+                # Check every 30 seconds
+                self.stop_event.wait(30)
 
-    def hide_cancel(self):
-        if "Cancel Schedule" in self.menu:
-            del self.menu["Cancel Schedule"]
+        self.check_thread = threading.Thread(target=check_loop, daemon=True)
+        self.check_thread.start()
 
-    def cancel(self, _):
-        self.cancel_event.set()
-        self.title = "⏰ Claude"
-        self.scheduled_time = None
-        self.hide_cancel()
-        self.stop_caffeinate()
-        rumps.notification("Claude Scheduler", "Cancelled", "Schedule cleared")
+    def trigger_claude(self):
+        # Open Terminal and start claude in tmux
+        cmd = 'tmux kill-session -t claude_session 2>/dev/null; tmux new-session -d -s claude_session \\"claude\\" && tmux attach -t claude_session'
+
+        script = f'''
+        tell application "Terminal"
+            activate
+            do script "{cmd}"
+        end tell
+        '''
+        subprocess.run(["osascript", "-e", script])
+
+        rumps.notification("Claude Scheduler", "Running!", f"Claude started at {datetime.now().strftime('%H:%M')}")
+
+        # Wait 30 seconds then send "hi" (in a separate thread)
+        def send_hi():
+            threading.Event().wait(30)
+            subprocess.run(["tmux", "send-keys", "-t", "claude_session", "hi"])
+            threading.Event().wait(1)
+            subprocess.run(["tmux", "send-keys", "-t", "claude_session", "Enter"])
+
+        threading.Thread(target=send_hi, daemon=True).start()
 
 if __name__ == "__main__":
     ClaudeScheduler().run()
