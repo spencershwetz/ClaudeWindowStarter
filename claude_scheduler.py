@@ -4,6 +4,7 @@ import threading
 import os
 import json
 from datetime import datetime, timedelta
+from collections import deque
 
 # Daily schedule times (24hr format)
 SCHEDULE_TIMES = ["04:00", "09:00", "14:00", "19:00"]
@@ -11,9 +12,62 @@ SCHEDULE_TIMES = ["04:00", "09:00", "14:00", "19:00"]
 # Preferences file
 PREFS_FILE = os.path.expanduser("~/.claude_scheduler_prefs.json")
 
+# Global log storage (last 50 entries)
+app_logs = deque(maxlen=50)
+
+
+def log(message):
+    """Add a timestamped log entry."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    entry = f"[{timestamp}] {message}"
+    app_logs.append(entry)
+    print(entry)  # Also print to console for debugging
+
+
+def get_tmux_path():
+    """Get the full path to tmux, or None if not installed."""
+    result = subprocess.run(["which", "tmux"], capture_output=True, text=True)
+    path = result.stdout.strip()
+    if not path:
+        # Try common locations
+        for p in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]:
+            if os.path.exists(p):
+                return p
+    return path if path else None
+
+
+def is_tmux_installed():
+    """Check if tmux is installed."""
+    return get_tmux_path() is not None
+
+
+def is_homebrew_installed():
+    """Check if Homebrew is installed."""
+    result = subprocess.run(["which", "brew"], capture_output=True, text=True)
+    return bool(result.stdout.strip())
+
+
+def install_tmux():
+    """Install tmux via Homebrew. Returns True if successful."""
+    if not is_homebrew_installed():
+        return False, "Homebrew not installed"
+
+    result = subprocess.run(
+        ["brew", "install", "tmux"],
+        capture_output=True,
+        text=True
+    )
+    return result.returncode == 0, result.stderr if result.returncode != 0 else ""
+
+
 class ClaudeScheduler(rumps.App):
     def __init__(self):
         super().__init__("⏰ Claude", icon=None, quit_button="Quit")
+
+        # Check for tmux on startup
+        if not is_tmux_installed():
+            self.handle_missing_tmux()
+
         self.auto_mode = False
         self.check_thread = None
         self.stop_event = threading.Event()
@@ -30,16 +84,92 @@ class ClaudeScheduler(rumps.App):
         self.next_label = rumps.MenuItem("Next: --:--", callback=None)
         self.next_label.set_callback(None)
         self.login_button = rumps.MenuItem("Start at Login", callback=self.toggle_login_item)
+        self.logs_button = rumps.MenuItem("View Logs", callback=self.show_logs)
+        self.test_hi_button = rumps.MenuItem("Test Send Hi Now", callback=self.test_send_hi)
 
         # Check if already in login items
         if self.is_login_item():
             self.login_button.state = 1
 
-        self.menu = [self.auto_button, self.custom_button, self.next_label, None, self.login_button]
+        self.menu = [self.auto_button, self.custom_button, self.next_label, None, self.login_button, self.logs_button, self.test_hi_button]
+
+        log("App started")
+        log(f"tmux path: {get_tmux_path()}")
 
         # Auto-start schedule if preference is set
         if self.load_prefs().get("auto_schedule_enabled", False):
             self.toggle_auto(self.auto_button)
+
+    def handle_missing_tmux(self):
+        """Handle the case when tmux is not installed."""
+        if is_homebrew_installed():
+            # Offer to install tmux
+            response = rumps.alert(
+                title="tmux Required",
+                message="Claude Scheduler requires tmux to run. Would you like to install it now via Homebrew?",
+                ok="Install tmux",
+                cancel="Quit"
+            )
+            if response == 1:  # User clicked "Install tmux"
+                rumps.notification("Claude Scheduler", "Installing...", "Installing tmux via Homebrew")
+                success, error = install_tmux()
+                if success:
+                    rumps.notification("Claude Scheduler", "Success!", "tmux installed successfully")
+                else:
+                    rumps.alert(
+                        title="Installation Failed",
+                        message=f"Failed to install tmux: {error}\n\nPlease run 'brew install tmux' manually.",
+                        ok="Quit"
+                    )
+                    rumps.quit_application()
+            else:
+                rumps.quit_application()
+        else:
+            # Homebrew not installed
+            rumps.alert(
+                title="tmux Required",
+                message="Claude Scheduler requires tmux.\n\nPlease install Homebrew first, then run:\nbrew install tmux\n\nVisit https://brew.sh for Homebrew installation.",
+                ok="Quit"
+            )
+            rumps.quit_application()
+
+    def show_logs(self, _):
+        """Display recent logs in a dialog."""
+        if app_logs:
+            log_text = "\n".join(app_logs)
+        else:
+            log_text = "No logs yet."
+        rumps.alert(title="Recent Logs", message=log_text, ok="Close")
+
+    def test_send_hi(self, _):
+        """Test sending 'hi' to tmux session immediately."""
+        log("test_send_hi: called")
+        tmux = get_tmux_path()
+        if not tmux:
+            log("test_send_hi: tmux not found!")
+            rumps.notification("Test", "Error", "tmux not found")
+            return
+
+        # First check if session exists
+        check = subprocess.run([tmux, "has-session", "-t", "claude_session"], capture_output=True, text=True)
+        log(f"test_send_hi: session check returncode={check.returncode}, stderr={check.stderr.strip()}")
+
+        if check.returncode != 0:
+            log("test_send_hi: session 'claude_session' does not exist!")
+            rumps.notification("Test", "Error", "No tmux session 'claude_session' found. Start Claude first.")
+            return
+
+        log("test_send_hi: sending 'hi'")
+        result1 = subprocess.run([tmux, "send-keys", "-t", "claude_session", "hi"], capture_output=True, text=True)
+        log(f"test_send_hi: send 'hi' returncode={result1.returncode}, stderr={result1.stderr.strip()}")
+
+        threading.Event().wait(0.5)
+
+        log("test_send_hi: sending Enter")
+        result2 = subprocess.run([tmux, "send-keys", "-t", "claude_session", "Enter"], capture_output=True, text=True)
+        log(f"test_send_hi: send Enter returncode={result2.returncode}, stderr={result2.stderr.strip()}")
+
+        rumps.notification("Test", "Done", "Check logs for results")
 
     def load_prefs(self):
         try:
@@ -256,26 +386,52 @@ class ClaudeScheduler(rumps.App):
         self.check_thread.start()
 
     def trigger_claude(self):
-        # Open Terminal and start claude in tmux
-        cmd = 'tmux kill-session -t claude_session 2>/dev/null; tmux new-session -d -s claude_session \\"claude\\" && tmux attach -t claude_session'
+        log("trigger_claude called")
 
+        # Get full path to tmux
+        tmux = get_tmux_path()
+        if not tmux:
+            log("ERROR: tmux not found!")
+            rumps.notification("Claude Scheduler", "Error", "tmux not found!")
+            return
+
+        log(f"Using tmux at: {tmux}")
+
+        # Open Terminal and start claude in tmux (use full path)
+        cmd = f'{tmux} kill-session -t claude_session 2>/dev/null; {tmux} new-session -d -s claude_session \\"claude\\" && {tmux} attach -t claude_session'
+
+        log(f"Running Terminal command")
         script = f'''
         tell application "Terminal"
             activate
             do script "{cmd}"
         end tell
         '''
-        subprocess.run(["osascript", "-e", script])
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        log(f"Terminal script result: returncode={result.returncode}")
+        if result.stderr:
+            log(f"Terminal script stderr: {result.stderr}")
 
         rumps.notification("Claude Scheduler", "Running!", f"Claude started at {datetime.now().strftime('%H:%M')}")
 
-        # Wait 30 seconds then send "hi" (in a separate thread)
+        # Wait 15 seconds then send "hi" (in a separate thread)
         def send_hi():
-            threading.Event().wait(30)
-            subprocess.run(["tmux", "send-keys", "-t", "claude_session", "hi"])
-            threading.Event().wait(1)
-            subprocess.run(["tmux", "send-keys", "-t", "claude_session", "Enter"])
+            log("send_hi: waiting 15 seconds...")
+            threading.Event().wait(15)
 
+            log("send_hi: sending 'hi' to tmux")
+            result1 = subprocess.run([tmux, "send-keys", "-t", "claude_session", "hi"], capture_output=True, text=True)
+            log(f"send_hi: send 'hi' result: returncode={result1.returncode}, stderr={result1.stderr}")
+
+            threading.Event().wait(1)
+
+            log("send_hi: sending Enter")
+            result2 = subprocess.run([tmux, "send-keys", "-t", "claude_session", "Enter"], capture_output=True, text=True)
+            log(f"send_hi: send Enter result: returncode={result2.returncode}, stderr={result2.stderr}")
+
+            log("send_hi: complete")
+
+        log("Starting send_hi thread")
         threading.Thread(target=send_hi, daemon=True).start()
 
 if __name__ == "__main__":
